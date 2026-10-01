@@ -1,0 +1,47 @@
+services:
+  # 可控源站：行为可经 http://localhost:8081/control/* 调整。
+  origin:
+    build:
+      context: .
+      target: runtime
+    image: cacheproxy-runtime
+    entrypoint: ["/usr/local/bin/origin"]
+    environment:
+      ORIGIN_ADDR: ":8081"
+    ports:
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8081/control/stats"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  # 缓存代理：只处理 GET /assets/{id}。
+  proxy:
+    build:
+      context: .
+      target: runtime
+    image: cacheproxy-runtime
+    entrypoint: ["/usr/local/bin/proxy"]
+    environment:
+      PROXY_ADDR: ":8080"
+      ORIGIN_URL: "http://origin:8081"
+    ports:
+      - "8080:8080"
+    depends_on:
+      origin:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/assets/healthcheck"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  # 一次性验收服务：构建后运行完整自动化测试（含 -race），退出码即验收结果。
+  # 用法：docker compose run --rm verify
+  verify:
+    profiles: ["verify"]
+    build:
+      context: .
+      target: verify
+    image: cacheproxy-verify
