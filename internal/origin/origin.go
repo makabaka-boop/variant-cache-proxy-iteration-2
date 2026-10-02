@@ -31,9 +31,12 @@ import (
 // AssetSpec 描述资源的可配置行为。
 type AssetSpec struct {
 	MaxAge  int    `json:"maxAge"`  // Cache-Control max-age，秒；<0 表示不发送 Cache-Control
+	SWR     *int   `json:"swr"`     // stale-while-revalidate 秒；nil（默认）表示不声明该指令，显式 0 仍属启用
+	Version int    `json:"version"` // 内容版本：决定变体 ETag 与正文（<1 视为 1）
 	HasETag bool   `json:"hasETag"` // 是否发送 ETag
 	Vary    string `json:"vary"`    // Vary 头内容；空串表示 Accept-Language
 	Fail    bool   `json:"fail"`    // 为 true 时对该资源返回 500
+	Status  int    `json:"status"`  // >0 时无条件返回该状态码（演练 4xx 失效等），覆盖 Fail
 	DelayMs int    `json:"delayMs"` // 处理前固定延迟，毫秒
 }
 
@@ -74,8 +77,9 @@ func New() *Controller {
 }
 
 // DefaultSpec 返回资源的默认配置：max-age=10、带 ETag、Vary: Accept-Language。
+// SWR 为 nil：默认不声明 stale-while-revalidate，代理侧保持同步再验证行为。
 func DefaultSpec() AssetSpec {
-	return AssetSpec{MaxAge: 10, HasETag: true, Vary: "Accept-Language"}
+	return AssetSpec{MaxAge: 10, Version: 1, HasETag: true, Vary: "Accept-Language"}
 }
 
 // SetSpec 直接以 Go 代码配置资源（测试使用）。
@@ -93,6 +97,27 @@ func (c *Controller) SetFail(id string, fail bool) {
 // SetMaxAge 调整资源 max-age（测试使用）。
 func (c *Controller) SetMaxAge(id string, maxAge int) {
 	c.withAsset(id, func(s *AssetSpec) { s.MaxAge = maxAge })
+}
+
+// SetSWR 调整资源 stale-while-revalidate 窗口（测试使用）。
+func (c *Controller) SetSWR(id string, swr int) {
+	n := swr
+	c.withAsset(id, func(s *AssetSpec) { s.SWR = &n })
+}
+
+// ClearSWR 取消资源的 stale-while-revalidate 声明（测试使用）。
+func (c *Controller) ClearSWR(id string) {
+	c.withAsset(id, func(s *AssetSpec) { s.SWR = nil })
+}
+
+// SetVersion 切换资源内容版本（测试使用）：ETag 与正文随之变化，确定性制造 200 新内容。
+func (c *Controller) SetVersion(id string, version int) {
+	c.withAsset(id, func(s *AssetSpec) { s.Version = version })
+}
+
+// SetStatus 注入固定响应状态码（测试使用）；0 清除注入。
+func (c *Controller) SetStatus(id string, status int) {
+	c.withAsset(id, func(s *AssetSpec) { s.Status = status })
 }
 
 // ResetStats 清空全部计数（测试使用）。
@@ -212,6 +237,15 @@ func (c *Controller) handleAsset(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 显式状态注入（如 404）：用于演练 4xx 对缓存条目的失效语义。
+	if spec.Status > 0 {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(spec.Status)
+		c.countStatus(bucket+":"+strconv.Itoa(spec.Status), 1)
+		_, _ = w.Write([]byte(fmt.Sprintf("origin injected status %d\n", spec.Status)))
+		return
+	}
+
 	if spec.Fail {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusInternalServerError)
@@ -220,9 +254,13 @@ func (c *Controller) handleAsset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	version := spec.Version
+	if version < 1 {
+		version = 1
+	}
 	etag := ""
 	if spec.HasETag {
-		etag = fmt.Sprintf("%q", id+"-"+string(variant)+"-v1")
+		etag = fmt.Sprintf("%q", fmt.Sprintf("%s-%s-v%d", id, string(variant), version))
 	}
 	vary := spec.Vary
 	if vary == "" {
@@ -233,7 +271,12 @@ func (c *Controller) handleAsset(w http.ResponseWriter, r *http.Request) {
 	h.Set("Content-Language", string(variant))
 	h.Set("Content-Type", "text/plain; charset=utf-8")
 	if spec.MaxAge >= 0 {
-		h.Set("Cache-Control", "public, max-age="+strconv.Itoa(spec.MaxAge))
+		cc := "public, max-age=" + strconv.Itoa(spec.MaxAge)
+		if spec.SWR != nil && supported {
+			// 窗口口径与代理、缓存状态共用同一个 delta-seconds 值。
+			cc += ", stale-while-revalidate=" + strconv.Itoa(*spec.SWR)
+		}
+		h.Set("Cache-Control", cc)
 	}
 	if etag != "" {
 		h.Set("ETag", etag)
@@ -252,7 +295,7 @@ func (c *Controller) handleAsset(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusOK)
 	c.countStatus(bucket+":200", 1)
-	body := fmt.Sprintf("asset=%s lang=%s v1\n", id, variant)
+	body := fmt.Sprintf("asset=%s lang=%s v%d\n", id, variant, version)
 	_, _ = w.Write([]byte(body))
 }
 
@@ -327,9 +370,12 @@ func (c *Controller) handleReset(w http.ResponseWriter, r *http.Request) {
 
 type setAssetReq struct {
 	MaxAge  *int    `json:"maxAge"`
+	SWR     *int    `json:"swr"`
+	Version *int    `json:"version"`
 	HasETag *bool   `json:"hasETag"`
 	Vary    *string `json:"vary"`
 	Fail    *bool   `json:"fail"`
+	Status  *int    `json:"status"`
 	DelayMs *int    `json:"delayMs"`
 }
 
@@ -362,6 +408,12 @@ func (c *Controller) handleSetAsset(w http.ResponseWriter, r *http.Request) {
 	if req.MaxAge != nil {
 		spec.MaxAge = *req.MaxAge
 	}
+	if req.SWR != nil {
+		spec.SWR = req.SWR
+	}
+	if req.Version != nil {
+		spec.Version = *req.Version
+	}
 	if req.HasETag != nil {
 		spec.HasETag = *req.HasETag
 	}
@@ -374,6 +426,9 @@ func (c *Controller) handleSetAsset(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Fail != nil {
 		spec.Fail = *req.Fail
+	}
+	if req.Status != nil {
+		spec.Status = *req.Status
 	}
 	if req.DelayMs != nil {
 		spec.DelayMs = *req.DelayMs

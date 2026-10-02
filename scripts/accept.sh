@@ -66,6 +66,35 @@ sr=$(header X-Cache-Status /tmp/rr)
 [ "$sr" = "revalidated" ] || { echo "FAIL: revalidation status=$sr"; exit 1; }
 echo "   revalidated"
 
+echo "== 5b. stale-while-revalidate：过期窗口内立即返回旧内容并后台续期"
+S=swr-demo
+curl_ -X POST "$ORIGIN/control/assets/$S" \
+	-H 'Content-Type: application/json' \
+	-d '{"maxAge":2,"swr":10,"version":1}' -o /dev/null
+curl_ "$PROXY/assets/$S" -H 'Accept-Language: zh' >/tmp/rs1
+[ "$(header X-Cache-Status /tmp/rs1)" = "miss" ] || { echo "FAIL: swr prime not miss"; exit 1; }
+case "$(header Cache-Control /tmp/rs1)" in *stale-while-revalidate=10*) ;; *)
+	echo "FAIL: swr directive not forwarded"; exit 1;; esac
+sleep 3 # max-age=2 已过期，仍在 swr=10 窗口
+curl_ "$PROXY/assets/$S" -H 'Accept-Language: zh' >/tmp/rs2
+[ "$(header X-Cache-Status /tmp/rs2)" = "stale" ] || { echo "FAIL: swr first not stale"; exit 1; }
+[ "$(header X-Cache-Stale /tmp/rs2)" = "1" ] || { echo "FAIL: missing X-Cache-Stale"; exit 1; }
+grep -qi '^warning:' /tmp/rs2 || { echo "FAIL: missing Warning"; exit 1; }
+grep -qi '^x-cache-error:' /tmp/rs2 && { echo "FAIL: swr stale must not carry X-Cache-Error"; exit 1; } || true
+sleep 1 # 等后台 304 续期落地
+curl_ "$PROXY/assets/$S" -H 'Accept-Language: zh' >/tmp/rs3
+[ "$(header X-Cache-Status /tmp/rs3)" = "hit" ] || { echo "FAIL: post-swr renewal want hit"; exit 1; }
+echo "   stale（无 X-Cache-Error）-> 后台 304 -> hit"
+
+echo "== 5c. 陈旧条目不凭客户端 If-None-Match 直接 304"
+sleep 3
+etag=$(header Etag /tmp/rs1)
+code=$(curl_ -o /tmp/rs4 -w '%{http_code}' "$PROXY/assets/$S" \
+	-H 'Accept-Language: zh' -H "If-None-Match: $etag")
+[ "$code" = "304" ] || { echo "FAIL: stale conditional expected upstream 304, got $code"; exit 1; }
+[ "$(header X-Cache-Status /tmp/rs4)" = "revalidated" ] || { echo "FAIL: want revalidated marker"; exit 1; }
+echo "   陈旧条件请求回源 304（revalidated）"
+
 echo "== 6. 并发合并：8 个同键请求只触发一次回源"
 curl_ -X POST "$ORIGIN/control/reset" -o /dev/null
 curl_ "$ORIGIN/control/gate/close" -o /dev/null

@@ -46,12 +46,31 @@ docker-compose.yml     origin、proxy 两个常驻服务 + 一次性 verify 服�
   - 另带 `X-Cache-Error: origin-500|origin-network-error|...`
 
   超出窗口或没有旧条目时返回 502（`X-Cache-Status: error`）。4xx 会作废旧条目。
+- **stale-while-revalidate 后台刷新模式**（仅当源站在 `Cache-Control` 上
+  **显式声明** `stale-while-revalidate=N` 时启用；未声明的资源一律保持上面的
+  同步再验证/故障兜底行为）：
+  - 非条件请求遇到“已过期但仍在该窗口内（`maxAge ≤ age ≤ maxAge+N`）”的条目时，
+    **立即**返回完整旧内容，并打上与兜底一致的陈旧标记
+    （`X-Cache-Status: stale`、`X-Cache-Stale: 1`、`Warning: 110`），
+    但不带 `X-Cache-Error`（这不是故障兜底）；
+  - 同时针对**同一资源、同一语言**只启动**一轮**后台**条件**回源
+    （携带旧条目 ETag 的 `If-None-Match`）。同步轮与后台轮在同一把锁下原子互斥，
+    任意时刻每键至多一轮回源；后台轮脱离任何客户端生命周期，发起者断开不影响它；
+  - 后台结果语义：源站 **304 续期**（storedAt 刷新、内容/ETag 沿用，采纳 304 上
+    更新的缓存头）；可缓存 **200 替换**条目；**4xx 按既有语义作废**旧条目；
+    **网络错误/5xx 保留**仍可用的旧内容，下一个窗口内请求再试；
+  - 后台结果提交前用指针比较确认它仍对应当前缓存条目；条目已被更新/删除时
+    **迟到结果整体丢弃**，绝不会把旧内容重新写成新版本；
+  - 窗口外（`age > maxAge+N`）恢复同步条件再验证。
 - **客户端条件请求**：`If-None-Match` 只在**正确变体**的缓存条目上校验：
   - 新鲜命中且 ETag 匹配 → 304（`X-Cache-Status: hit`）；
+  - **陈旧条目永不凭客户端校验器直接回 304**——即使 ETag 匹配也先回源条件
+    验证（SWR 窗口内也不例外：条件请求不触发后台轮，而是同步等待/回源）；
   - 跨语言 ETag 不可能命中（zh 的 ETag 去问 en 返回完整 200）；
   - 本地无缓存时携带客户端校验器透传回源（200 可正常入缓存）。
 - 新鲜度边界：`age == max-age` 即过期；`age == max-age + 30s` 仍可兜底，
-  再多 1 秒则 502。
+  再多 1 秒则 502。SWR 窗口同理：`age == max-age + swr` 仍可立即返回旧内容，
+  再多 1 秒恢复同步再验证。
 - 可观测响应头 `X-Cache-Status`：`miss | hit | revalidated | stale | bypass | error`，
   有缓存的响应还带 `Age`。
 
@@ -98,12 +117,19 @@ go test -race -count=1 ./...   # 或 make test-race
 - 并发合并：闸门挂起源站，断言 8 个同键请求只有 1 次回源、在飞峰值为 1；
   zh/en 同时并发时各 1 次、峰值为 2；
 - 取消：等待者取消后快速返回、不触发额外回源，其他等待者正常拿到结果；
-  发起者（leader）取消后回源仍完成，后来加入者复用同一轮；
+  发起者（leader）取消后回源仍完成，后来加入者复用同一轮；SWR 触发请求
+  结束后，被闸门挂住的后台轮仍自行完成并填充缓存；
 - 过期边界：`maxAge`、`maxAge+30s`、`maxAge+31s` 三个边界点的
   hit / stale / 502 行为；源站 304 续期后的新鲜窗口；
+- stale-while-revalidate：`maxAge`、`maxAge+swr`、`maxAge+swr+1s` 的
+  stale / stale / 同步再验证边界；窗口内显式陈旧标记（无 `X-Cache-Error`）；
+  每 (资源, 变体) 只有一轮后台条件回源；后台 304 续期、可缓存 200 替换、
+  4xx 作废、5xx 与网络错误保留旧内容；迟到提交（条目已前进）结果被丢弃；
+  客户端 If-None-Match 在陈旧条目上不直接 304；未声明指令的资源保持旧行为；
 - 跨语言隔离：zh/en 独立缓存、独立 ETag，跨语言条件请求不 304，
-  stale 兜底也不会串语言；
-- 可缓存性矩阵：max-age 0/60/61、缺 ETag、`Vary: *`、多字段 Vary、no-store 等；
+  stale 兜底也不会串语言；双语言后台刷新各自独立（峰值为 2）；
+- 可缓存性矩阵：max-age 0/60/61、缺 ETag、`Vary: *`、多字段 Vary、no-store、
+  stale-while-revalidate 合法/非法写法等；
 - 不支持变体 `no-store`、冷条件透传、路由 404/405、源站控制面冒烟。
 
 ### 2. 端到端冒烟脚本（对运行中的栈）
@@ -136,9 +162,22 @@ curl -X POST http://localhost:8081/control/assets/demo \
   -H 'Content-Type: application/json' \
   -d '{"maxAge":5,"hasETag":true,"vary":"Accept-Language"}'
 
+# 显式启用 stale-while-revalidate=15（SWR 后台刷新模式）
+curl -X POST http://localhost:8081/control/assets/demo \
+  -H 'Content-Type: application/json' \
+  -d '{"maxAge":5,"swr":15}'
+
+# 把内容升级到 v2（ETag/正文随之变化，确定性制造条件回源 200）
+curl -X POST http://localhost:8081/control/assets/demo \
+  -H 'Content-Type: application/json' -d '{"version":2}'
+
 # 注入 500 故障（演练 stale 兜底）
 curl -X POST http://localhost:8081/control/assets/demo \
   -H 'Content-Type: application/json' -d '{"fail":true}'
+
+# 注入 404（演练 4xx 失效语义）
+curl -X POST http://localhost:8081/control/assets/demo \
+  -H 'Content-Type: application/json' -d '{"status":404}'
 
 # 让响应不可缓存（缺 ETag / Vary 不兼容 / max-age 越界）
 curl -X POST http://localhost:8081/control/assets/demo \
@@ -154,8 +193,11 @@ curl -s http://localhost:8081/control/stats
   `Accept-Language` 的解释完全一致，从根上避免“代理认为是 A、源站按 B 应答”。
 - **回源请求只发送单一语言标签**（`zh` 或 `en`），源站返回什么变体完全确定，
   不信任源站可能出错的 `Content-Language` 来决定缓存键。
-- 合并原语（`internal/proxy/flight.go`）的 leader 用
-  `context.WithoutCancel` 脱离请求生命周期，并在 leader 协程里等待回源
-  完成、发布结果后再拆键；等待者取消只影响自己。
+- 合并原语（`internal/proxy/round.go`）用每键一个 `round` 统一同步回源与
+  SWR 后台刷新：两种轮次在同一把锁下原子互斥（任意时刻每键至多一轮），
+  同步等待者可中途放弃，后台轮与同步 leader 都用
+  `context.WithoutCancel` 脱离请求生命周期，提交缓存后再关闭通道通知等待者。
+  后台/同步结论提交都做“条目指针仍是发起依据”的 CAS 校验，迟到结果让位。
 - 时间只来自可注入的 `Clock` 接口；代理没有后台清理 goroutine，
-  过期判断全部发生在请求路径上。
+  过期判断全部发生在请求路径上。SWR 窗口口径（解析器、源站指令、缓存条目、
+  HTTP 响应）共用同一个 delta-seconds 值。
