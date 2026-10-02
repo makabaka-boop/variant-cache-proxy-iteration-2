@@ -52,6 +52,42 @@ func TestCacheable(t *testing.T) {
 	}
 }
 
+func TestStaleWhileRevalidate(t *testing.T) {
+	cases := []struct {
+		name    string
+		cc      string
+		want    int
+		present bool
+	}{
+		{"absent", "public, max-age=10", 0, false},
+		{"explicit zero", "max-age=10, stale-while-revalidate=0", 0, true},
+		{"five seconds", "max-age=10, stale-while-revalidate=5", 5, true},
+		{"case insensitive", "max-age=10, STALE-WHILE-REVALIDATE=7", 7, true},
+		{"missing value ignored", "max-age=10, stale-while-revalidate", 0, false},
+		{"negative ignored", "max-age=10, stale-while-revalidate=-1", 0, false},
+		{"garbage ignored", "max-age=10, stale-while-revalidate=abc", 0, false},
+		{"multiple headers last wins", "stale-while-revalidate=3", 0, false}, // 仅一条头
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			h := http.Header{}
+			h.Set("Cache-Control", c.cc)
+			if c.name == "multiple headers last wins" {
+				h.Add("Cache-Control", "stale-while-revalidate=9")
+				got, present := staleWhileRevalidate(h)
+				if !present || got != 9 {
+					t.Fatalf("multi-header swr want present/9, got %d/%v", got, present)
+				}
+				return
+			}
+			got, present := staleWhileRevalidate(h)
+			if present != c.present || (present && got != c.want) {
+				t.Fatalf("swr(%q) = %d,%v want %d,%v", c.cc, got, present, c.want, c.present)
+			}
+		})
+	}
+}
+
 func TestEtagStrongMatch(t *testing.T) {
 	if !etagStrongMatch(`"a"`, `"a"`) {
 		t.Fatal("exact match")
@@ -93,5 +129,51 @@ func TestFreshnessBoundaries(t *testing.T) {
 	clk.Advance(time.Second)
 	if p.staleUsable(e) {
 		t.Fatal("past maxAge+30s must not be servable")
+	}
+}
+
+func TestSWRWindowBoundaries(t *testing.T) {
+	clk := newFakeClock()
+	p := &Proxy{clock: clk, store: map[string]*entry{}}
+
+	// 未声明 SWR 的条目：任何时刻都不进入后台更新窗口。
+	plain := &entry{maxAge: 10, storedAt: clk.Now(), swrSet: false, swr: 5}
+	clk.Advance(10 * time.Second)
+	if p.withinSWR(plain) {
+		t.Fatal("entry without explicit swr must never enter SWR window")
+	}
+
+	// 显式 swr=5：maxAge、maxAge+5s 在窗内，再多 1 秒出窗。
+	swr := &entry{maxAge: 10, storedAt: clk.Now(), swrSet: true, swr: 5}
+	if p.withinSWR(swr) {
+		t.Fatal("fresh entry must not be within SWR window")
+	}
+	clk.Advance(10 * time.Second)
+	if !p.withinSWR(swr) {
+		t.Fatal("at exactly maxAge must be within SWR window")
+	}
+	clk.Advance(5 * time.Second)
+	if !p.withinSWR(swr) {
+		t.Fatal("at exactly maxAge+swr must still be within window")
+	}
+	clk.Advance(time.Second)
+	if p.withinSWR(swr) {
+		t.Fatal("beyond maxAge+swr must leave SWR window")
+	}
+
+	// 显式 swr=0：仅 age==maxAge 一刻成立（用独立时钟，起点为零点）。
+	c0 := newFakeClock()
+	p0 := &Proxy{clock: c0, store: map[string]*entry{}}
+	zero := &entry{maxAge: 10, storedAt: c0.Now(), swrSet: true, swr: 0}
+	if p0.withinSWR(zero) {
+		t.Fatal("fresh swr=0 entry must not be within window")
+	}
+	c0.Advance(10 * time.Second)
+	if !p0.withinSWR(zero) {
+		t.Fatal("at exactly maxAge swr=0 must be within window")
+	}
+	c0.Advance(time.Second)
+	if p0.withinSWR(zero) {
+		t.Fatal("one second past maxAge swr=0 must leave window")
 	}
 }

@@ -30,11 +30,18 @@ import (
 
 // AssetSpec 描述资源的可配置行为。
 type AssetSpec struct {
-	MaxAge  int    `json:"maxAge"`  // Cache-Control max-age，秒；<0 表示不发送 Cache-Control
-	HasETag bool   `json:"hasETag"` // 是否发送 ETag
-	Vary    string `json:"vary"`    // Vary 头内容；空串表示 Accept-Language
-	Fail    bool   `json:"fail"`    // 为 true 时对该资源返回 500
-	DelayMs int    `json:"delayMs"` // 处理前固定延迟，毫秒
+	MaxAge     int    `json:"maxAge"`     // Cache-Control max-age，秒；<0 表示不发送 Cache-Control
+	HasETag    bool   `json:"hasETag"`    // 是否发送 ETag
+	Vary       string `json:"vary"`       // Vary 头内容；空串表示 Accept-Language
+	Fail       bool   `json:"fail"`       // 为 true 时对该资源返回 500（或 FailStatus 指定的错误码）
+	FailStatus int    `json:"failStatus"` // 故障时返回的状态码；0 表示 500
+	Version    int    `json:"version"`    // 内容版本：决定正文与 ETag 的 vN 后缀，用于模拟素材更新
+	DelayMs    int    `json:"delayMs"`    // 处理前固定延迟，毫秒
+	// SWR 是 stale-while-revalidate 窗口（秒），用指针区分“未声明”与“显式 0”：
+	//   nil：不发送该指令（默认，保持同步再验证/出错兜底语义）；
+	//   *0：显式 stale-while-revalidate=0（仅 age==maxAge 一刻可陈旧）；
+	//   *N：显式声明 N 秒窗口。
+	SWR *int `json:"swr"`
 }
 
 // Stats 是源站观测计数，全部按变体统计（unsupported 归入 other）。
@@ -75,7 +82,7 @@ func New() *Controller {
 
 // DefaultSpec 返回资源的默认配置：max-age=10、带 ETag、Vary: Accept-Language。
 func DefaultSpec() AssetSpec {
-	return AssetSpec{MaxAge: 10, HasETag: true, Vary: "Accept-Language"}
+	return AssetSpec{MaxAge: 10, HasETag: true, Vary: "Accept-Language", Version: 1}
 }
 
 // SetSpec 直接以 Go 代码配置资源（测试使用）。
@@ -204,6 +211,12 @@ func (c *Controller) handleAsset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 闸门放行后重新读取最新配置：素材可能在请求排队期间被编辑更新，
+	// 让挂起的后台刷新拿到“放行时刻”的最新内容（确定性模拟编辑后回源）。
+	if latest, exists := c.assetSpec(id); exists {
+		spec = latest
+	}
+
 	if spec.DelayMs > 0 {
 		select {
 		case <-time.After(time.Duration(spec.DelayMs) * time.Millisecond):
@@ -213,16 +226,24 @@ func (c *Controller) handleAsset(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if spec.Fail {
+		code := spec.FailStatus
+		if code == 0 {
+			code = http.StatusInternalServerError
+		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.WriteHeader(http.StatusInternalServerError)
-		c.countStatus(bucket+":500", 1)
+		w.WriteHeader(code)
+		c.countStatus(bucket+":"+strconv.Itoa(code), 1)
 		_, _ = w.Write([]byte("origin injected failure\n"))
 		return
 	}
 
+	version := spec.Version
+	if version <= 0 {
+		version = 1
+	}
 	etag := ""
 	if spec.HasETag {
-		etag = fmt.Sprintf("%q", id+"-"+string(variant)+"-v1")
+		etag = fmt.Sprintf("%q", id+"-"+string(variant)+"-v"+strconv.Itoa(version))
 	}
 	vary := spec.Vary
 	if vary == "" {
@@ -233,7 +254,12 @@ func (c *Controller) handleAsset(w http.ResponseWriter, r *http.Request) {
 	h.Set("Content-Language", string(variant))
 	h.Set("Content-Type", "text/plain; charset=utf-8")
 	if spec.MaxAge >= 0 {
-		h.Set("Cache-Control", "public, max-age="+strconv.Itoa(spec.MaxAge))
+		cc := "public, max-age=" + strconv.Itoa(spec.MaxAge)
+		if spec.SWR != nil {
+			// 由源站显式启用 stale-while-revalidate：解析器/缓存/响应同一窗口口径。
+			cc += ", stale-while-revalidate=" + strconv.Itoa(*spec.SWR)
+		}
+		h.Set("Cache-Control", cc)
 	}
 	if etag != "" {
 		h.Set("ETag", etag)
@@ -252,7 +278,7 @@ func (c *Controller) handleAsset(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusOK)
 	c.countStatus(bucket+":200", 1)
-	body := fmt.Sprintf("asset=%s lang=%s v1\n", id, variant)
+	body := fmt.Sprintf("asset=%s lang=%s v%d\n", id, variant, version)
 	_, _ = w.Write([]byte(body))
 }
 
@@ -260,6 +286,17 @@ func (st *assetState) snapshot() AssetSpec {
 	st.mu.RLock()
 	defer st.mu.RUnlock()
 	return st.spec
+}
+
+// assetSpec 读取资源当前配置的快照（供闸门放行后获取最新素材状态）。
+func (c *Controller) assetSpec(id string) (AssetSpec, bool) {
+	c.mu.Lock()
+	st, ok := c.assets[id]
+	c.mu.Unlock()
+	if !ok {
+		return AssetSpec{}, false
+	}
+	return st.snapshot(), true
 }
 
 // enterGate 在测试闸门关闭时阻塞；客户端断开时立即返回。
@@ -326,11 +363,14 @@ func (c *Controller) handleReset(w http.ResponseWriter, r *http.Request) {
 }
 
 type setAssetReq struct {
-	MaxAge  *int    `json:"maxAge"`
-	HasETag *bool   `json:"hasETag"`
-	Vary    *string `json:"vary"`
-	Fail    *bool   `json:"fail"`
-	DelayMs *int    `json:"delayMs"`
+	MaxAge     *int    `json:"maxAge"`
+	HasETag    *bool   `json:"hasETag"`
+	Vary       *string `json:"vary"`
+	Fail       *bool   `json:"fail"`
+	FailStatus *int    `json:"failStatus"`
+	Version    *int    `json:"version"`
+	SWR        *int    `json:"swr"`
+	DelayMs    *int    `json:"delayMs"`
 }
 
 func (c *Controller) handleSetAsset(w http.ResponseWriter, r *http.Request) {
@@ -374,6 +414,16 @@ func (c *Controller) handleSetAsset(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Fail != nil {
 		spec.Fail = *req.Fail
+	}
+	if req.FailStatus != nil {
+		spec.FailStatus = *req.FailStatus
+	}
+	if req.Version != nil {
+		spec.Version = *req.Version
+	}
+	if req.SWR != nil {
+		v := *req.SWR
+		spec.SWR = &v
 	}
 	if req.DelayMs != nil {
 		spec.DelayMs = *req.DelayMs

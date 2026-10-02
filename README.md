@@ -34,6 +34,25 @@ docker-compose.yml     origin、proxy 两个常驻服务 + 一次性 verify 服�
 - **过期再验证**：新鲜期过后带 `If-None-Match` 回源；源站 304 时以
   **原响应的 max-age** 刷新新鲜期（`storedAt = now`，内容与 ETag 沿用，
   304 上更新的缓存头/ETag 一并采纳）。
+- **stale-while-revalidate 后台更新模式**（必须由源站在 `Cache-Control`
+  显式声明 `stale-while-revalidate=N` 才启用；未声明的资源保持下面的同步
+  再验证/出错兜底行为不变）：
+  - 条目已过期、但 `age ≤ max-age + N`（含两端边界）且请求**不带**
+    `If-None-Match` 时，**立即**返回带明确陈旧标记的**完整旧内容**
+    （`X-Cache-Status: stale`、`X-Cache-Stale: 1`、`Warning: 110`），
+    不让仍在允许窗口内的语言版本等待回源；同时对同一资源、同一语言
+    **只启动一轮**后台条件回源（并发合并，后续请求同样立即取旧）。
+  - 客户端带 `If-None-Match` 时**绝不**凭陈旧条目直接回 304：仍走同步
+    条件再验证，可加入正在进行的那一轮后台回源等待结果，但不另起回源。
+  - 后台回源结果：304 续期；可缓存 200 替换条目；4xx 按现有失效语义
+    作废；**网络错误或 5xx 不抹去仍可用的旧内容**。
+  - **提交守卫**：后台结果写入前用 CAS 确认它对应的仍是当前缓存条目；
+    刷新期间条目已被更新时，迟到的 304/200/4xx 一律丢弃，绝不把旧内容
+    重新写成新版本。
+  - 后台刷新运行在脱离客户端生命周期的上下文上：发起者或等待者取消
+    只会影响自己的响应，不中断其他客户端共享的这一轮刷新。
+  - 窗口口径在解析器、可控源站、缓存新鲜度与 HTTP 响应间完全一致
+    （同一条 `stale-while-revalidate=N` 头）。
 - **并发合并**：同一资源、同一变体的并发请求只产生一次回源；等待者中途
   取消不会中断回源，也不影响其他等待者——回源使用脱离客户端生命周期的
   上下文，即便发起者断开，回源仍会完成并填充缓存。不同变体（zh/en）
@@ -51,9 +70,11 @@ docker-compose.yml     origin、proxy 两个常驻服务 + 一次性 verify 服�
   - 跨语言 ETag 不可能命中（zh 的 ETag 去问 en 返回完整 200）；
   - 本地无缓存时携带客户端校验器透传回源（200 可正常入缓存）。
 - 新鲜度边界：`age == max-age` 即过期；`age == max-age + 30s` 仍可兜底，
-  再多 1 秒则 502。
+  再多 1 秒则 502。声明 SWR 时 `age == max-age + N` 仍可后台更新（含边界，
+  `N=0` 仅在恰好过期这一刻成立），再多 1 秒回落到同步再验证/兜底。
 - 可观测响应头 `X-Cache-Status`：`miss | hit | revalidated | stale | bypass | error`，
-  有缓存的响应还带 `Age`。
+  有缓存的响应还带 `Age`。SWR 主动陈旧与出错兜底都标 `stale`，区别是后者
+  额外带 `X-Cache-Error`。
 
 ## 前置条件
 
@@ -104,7 +125,13 @@ go test -race -count=1 ./...   # 或 make test-race
 - 跨语言隔离：zh/en 独立缓存、独立 ETag，跨语言条件请求不 304，
   stale 兜底也不会串语言；
 - 可缓存性矩阵：max-age 0/60/61、缺 ETag、`Vary: *`、多字段 Vary、no-store 等；
-- 不支持变体 `no-store`、冷条件透传、路由 404/405、源站控制面冒烟。
+- 不支持变体 `no-store`、冷条件透传、路由 404/405、源站控制面冒烟；
+- stale-while-revalidate：窗口内立即返回标记过的完整旧内容且只跑一轮后台
+  条件刷新（闸门下多并发只 1 次回源）；边界 `maxAge`/`maxAge+N`/`+N+1` 与
+  显式 `N=0`；客户端 `If-None-Match` 不凭陈旧条目 304、并加入同一轮等待；
+  304 续期、200 换版本、4xx 作废、5xx/网络错误保留旧内容；双语言各自独立
+  一轮且不串内容；迟到 304/200/4xx 被提交守卫拒绝（白盒 CAS 测试）；
+  取消不中断共享刷新；未声明指令保持同步再验证。
 
 ### 2. 端到端冒烟脚本（对运行中的栈）
 
@@ -136,9 +163,20 @@ curl -X POST http://localhost:8081/control/assets/demo \
   -H 'Content-Type: application/json' \
   -d '{"maxAge":5,"hasETag":true,"vary":"Accept-Language"}'
 
-# 注入 500 故障（演练 stale 兜底）
+# 显式启用 stale-while-revalidate：过期后 20 秒内先给旧内容、后台刷新
+curl -X POST http://localhost:8081/control/assets/demo \
+  -H 'Content-Type: application/json' \
+  -d '{"maxAge":5,"hasETag":true,"swr":20}'
+
+# 模拟素材被编辑（正文/ETag 切到 v2，用于演练后台刷新换版本）
+curl -X POST http://localhost:8081/control/assets/demo \
+  -H 'Content-Type: application/json' -d '{"version":2}'
+
+# 注入 500 故障（演练 stale 兜底），或用 failStatus 注入 404
 curl -X POST http://localhost:8081/control/assets/demo \
   -H 'Content-Type: application/json' -d '{"fail":true}'
+curl -X POST http://localhost:8081/control/assets/demo \
+  -H 'Content-Type: application/json' -d '{"fail":true,"failStatus":404}'
 
 # 让响应不可缓存（缺 ETag / Vary 不兼容 / max-age 越界）
 curl -X POST http://localhost:8081/control/assets/demo \

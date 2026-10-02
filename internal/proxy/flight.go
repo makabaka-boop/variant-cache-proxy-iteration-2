@@ -38,6 +38,9 @@ func newFlightGroup() *flightGroup {
 //   - leader==false 且 ok==true：本协程是等待者，应阻塞在 wait 上；
 //     若 ctx 先结束可提前退出，不影响任何人。
 //   - ok==false：本轮已被别人完成并清理（迟到者），调用方应重新检查缓存。
+//
+// 当前实现中同键轮次串行（Finish 后下一个 Do 才可能建新轮），因此
+// ok==false 不会出现；调用方仍按签名接收该值以保留语义。
 func (g *flightGroup) Do(key string) (f *flight, leader bool, ok bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()

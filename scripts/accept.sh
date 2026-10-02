@@ -84,5 +84,36 @@ stats=$(curl_ "$ORIGIN/control/stats")
 echo "$stats" | grep -q '"zh":1' || { echo "FAIL: total fetch after gate, stats=$stats"; exit 1; }
 echo "   闸门期间仅 1 次回源，放行后全部等待者拿到同一结果"
 
+echo "== 7. stale-while-revalidate：窗口内先陈旧、后台换成新版本"
+SW=swr-demo
+curl_ -X POST "$ORIGIN/control/reset" -o /dev/null
+curl_ -X POST "$ORIGIN/control/assets/$SW" -H 'Content-Type: application/json' \
+	-d '{"maxAge":2,"hasETag":true,"swr":30,"version":1}' -o /dev/null
+curl_ "$PROXY/assets/$SW" -H 'Accept-Language: zh' -o /tmp/sw1
+cc=$(header Cache-Control /tmp/sw1)
+echo "$cc" | grep -q 'stale-while-revalidate=30' \
+	|| { echo "FAIL: swr directive not served, cc=$cc"; exit 1; }
+sleep 3 # 已过期但仍在 30s SWR 窗口
+# 挂起源站，确认过期请求立即返回带标记旧内容，同时后台只有一轮回源。
+curl_ "$ORIGIN/control/gate/close" -o /dev/null
+curl_ "$PROXY/assets/$SW" -H 'Accept-Language: zh' >/tmp/sw2
+sc=$(header X-Cache-Status /tmp/sw2); xs=$(header X-Cache-Stale /tmp/sw2)
+[ "$sc" = "stale" ] && [ "$xs" = "1" ] \
+	|| { echo "FAIL: in-window want stale/1, got $sc/$xs"; exit 1; }
+grep -q ' v1$' /tmp/sw2 || { echo "FAIL: stale body must be old v1"; exit 1; }
+sleep 0.5
+stats=$(curl_ "$ORIGIN/control/stats")
+echo "$stats" | grep -q '"zh":2' || { echo "FAIL: SWR must start exactly one refresh (prime+1), stats=$stats"; exit 1; }
+# 素材在刷新期间被编辑成 v2，放行后台刷新。
+curl_ -X POST "$ORIGIN/control/assets/$SW" -H 'Content-Type: application/json' \
+	-d '{"version":2}' -o /dev/null
+curl_ "$ORIGIN/control/gate/open" -o /dev/null
+sleep 0.8
+curl_ "$PROXY/assets/$SW" -H 'Accept-Language: zh' >/tmp/sw3
+sc3=$(header X-Cache-Status /tmp/sw3)
+grep -q ' v2$' /tmp/sw3 || { echo "FAIL: after refresh want new v2 body, got $(cat /tmp/sw3)"; exit 1; }
+[ "$sc3" = "hit" ] || { echo "FAIL: refreshed content want hit, got $sc3"; exit 1; }
+echo "   窗口内 stale(v1) -> 后台单轮 -> 放行后 hit(v2)"
+
 echo
 echo "ACCEPT SMOKE OK"

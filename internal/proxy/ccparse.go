@@ -12,6 +12,8 @@ type cacheDirectives struct {
 	private bool
 	noCache bool
 	maxAge  *int
+	// swr 是显式声明的 stale-while-revalidate 窗口（秒）；nil 表示未声明。
+	swr *int
 }
 
 // parseCacheControl 解析响应的 Cache-Control 头（多条逗号合并）。
@@ -40,6 +42,11 @@ func parseCacheControl(header http.Header) cacheDirectives {
 			case "max-age":
 				if n, err := strconv.Atoi(value); err == nil {
 					d.maxAge = &n
+				}
+			case "stale-while-revalidate":
+				// 仅接受非负整数 delta-seconds；非法或缺值忽略（等同未声明）。
+				if n, err := strconv.Atoi(value); err == nil && n >= 0 {
+					d.swr = &n
 				}
 			}
 		}
@@ -100,6 +107,17 @@ func cacheable(h http.Header) (ttl int, ok bool) {
 		return 0, false
 	}
 	return *d.maxAge, true
+}
+
+// staleWhileRevalidate 解析 Cache-Control 中显式声明的 stale-while-revalidate
+// 窗口（秒）。未声明或值非法时 present 为 false，调用方必须据此区分
+// “显式声明 0”与“未声明”——只有显式声明才启用后台更新模式。
+func staleWhileRevalidate(h http.Header) (seconds int, present bool) {
+	d := parseCacheControl(h)
+	if d.swr == nil {
+		return 0, false
+	}
+	return *d.swr, true
 }
 
 // etagStrongMatch 判断客户端的 If-None-Match 是否命中某个 ETag。

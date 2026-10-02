@@ -11,6 +11,10 @@
 //   - 同键并发请求通过 flightGroup 合并为一次回源；等待者取消不影响他人；
 //   - 回源遇到网络错误或 5xx 时，可返回已过期但不超过 30 秒的旧响应，
 //     并显式打上 X-Cache-Status: stale 与 Warning 110 标记；
+//   - 源站显式声明 stale-while-revalidate=N 时，过期但仍在该窗口内的请求
+//     先立即返回带陈旧标记的完整旧内容，同时只启动一轮后台条件回源；
+//     客户端 If-None-Match 不享受该模式，仍走同步条件再验证；后台结果
+//     必须通过 CAS 提交，迟到刷新不会覆盖已被更新的条目；
 //   - 客户端 If-None-Match 只在正确变体的缓存条目上校验，跨语言不可能 304。
 package proxy
 
@@ -59,6 +63,10 @@ type entry struct {
 	etag     string
 	maxAge   int
 	storedAt time.Time
+	// swrSet/swr 记录源站在产生此条目时是否显式声明了
+	// stale-while-revalidate 窗口及其秒数；只有显式声明才启用后台更新模式。
+	swrSet bool
+	swr    int
 }
 
 // age 返回条目自存储以来经过的时间。
@@ -76,6 +84,17 @@ func (p *Proxy) staleUsable(e *entry) bool {
 	a := p.age(e)
 	return a >= time.Duration(e.maxAge)*time.Second &&
 		a <= time.Duration(e.maxAge)*time.Second+staleServeWindow
+}
+
+// withinSWR 判断过期条目是否仍处于源站显式声明的 stale-while-revalidate
+// 窗口内（含 maxAge+swr 整边界；显式声明 swr=0 时仅 age==maxAge 这一刻成立）。
+func (p *Proxy) withinSWR(e *entry) bool {
+	if !e.swrSet {
+		return false
+	}
+	a := p.age(e)
+	return a >= time.Duration(e.maxAge)*time.Second &&
+		a <= time.Duration(e.maxAge)*time.Second+time.Duration(e.swr)*time.Second
 }
 
 // New 创建代理，originBase 为源站基址（如 http://origin:8081）。
@@ -125,12 +144,16 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	key := cacheKey(id, variant)
 	clientINM := r.Header.Get("If-None-Match")
 
-	if e := p.lookup(key); e != nil && p.fresh(e) {
-		writeStored(w, p.clock, e, "hit", clientINM)
-		return
+	var cached *entry
+	if e := p.lookup(key); e != nil {
+		cached = e
+		if p.fresh(e) {
+			writeStored(w, p.clock, e, "hit", clientINM)
+			return
+		}
 	}
 
-	if e := p.lookup(key); e == nil && clientINM != "" {
+	if cached == nil && clientINM != "" {
 		// 冷路径上的客户端条件请求：本地没有“正确变体”的表示可供校验，
 		// 而响应取决于客户端持有的具体校验器，故直接透传（不做合并）；
 		// 若源站给出可缓存的 200，仍然写入共享缓存。
@@ -138,7 +161,22 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 冷缺失或过期再验证：同键并发合并为一次回源。
+	// 过期条目 + 源站显式启用 stale-while-revalidate + 非条件请求：
+	// 立即返回完整旧内容（显式陈旧标记），同时只启动一轮后台条件回源。
+	// 客户端携带 If-None-Match 时绝不走这条路——不允许凭陈旧条目直接 304。
+	if cached != nil && clientINM == "" && p.withinSWR(cached) {
+		p.serveStaleWhileRevalidate(w, r, key, id, variant, cached)
+		return
+	}
+
+	// 冷缺失，或未声明 SWR / 超出 SWR 窗口，或客户端条件请求：同步再验证。
+	p.serveSync(w, r, key, id, variant, clientINM)
+}
+
+// serveSync 处理冷缺失与同步再验证：同键并发合并为一次回源。
+// leader 使用脱离客户端生命周期的上下文完成回源；等待者可随时取消，
+// 取消只影响自己，不影响 leader 与其他等待者。
+func (p *Proxy) serveSync(w http.ResponseWriter, r *http.Request, key, id string, variant lang.Variant, clientINM string) {
 	f, leader, ok := p.flights.Do(key)
 	if !ok {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -179,6 +217,60 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	writeOutcome(w, p.clock, f.outcome(), clientINM)
 }
 
+// serveStaleWhileRevalidate 处理 SWR 窗口内的过期非条件请求：立即给出带
+// 明确陈旧标记的完整旧内容，并确保同一资源、同一语言只有一轮后台条件回源。
+// 成为等待者的请求同样立即拿到旧内容——后台结果不阻塞任何 SWR 客户端。
+func (p *Proxy) serveStaleWhileRevalidate(w http.ResponseWriter, r *http.Request, key, id string, variant lang.Variant, e *entry) {
+	f, leader, _ := p.flights.Do(key)
+	if !leader {
+		// 已有一轮后台刷新在跑：不新建，立即返回陈旧内容。
+		writeStale(w, p.clock, e, "")
+		return
+	}
+
+	// 成为 leader 后、启动后台协程前再复核一次：Do 与发起请求之间是有窗口的，
+	// 条目可能恰好在此刻被其他路径（如同步回源）更新。当前条目仍有效就直接
+	// 作答；否则不启动后台刷新，拆键并退回常规路径重新判定。
+	if cur := p.lookup(key); cur != e {
+		p.flights.Finish(key, f)
+		if cur != nil && p.fresh(cur) {
+			writeStored(w, p.clock, cur, "hit", "")
+			return
+		}
+		p.serveSync(w, r, key, id, variant, "")
+		return
+	}
+
+	// 后台刷新脱离发起它的客户端：该请求写完陈旧响应即结束，
+	// 但回源仍会跑完并发布，共享给同步等待者与后续请求。
+	go p.runBackgroundRefresh(key, id, variant, e, f)
+	// 客户端取消只影响自己的响应写出，不中断共享刷新。
+	writeStale(w, p.clock, e, "")
+}
+
+// runBackgroundRefresh 在独立协程里完成一轮后台条件回源，并通过 CAS 守卫
+// 提交结果：只有回源对应的条目仍是当前缓存条目时才允许写入，迟到刷新
+// （条目已被其他路径更新）的结果一律丢弃。
+func (p *Proxy) runBackgroundRefresh(key, id string, variant lang.Variant, base *entry, f *flight) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// 提交前守卫（第一道）：启动前再次确认条目仍是发起本轮时的条目。
+	if cur := p.lookup(key); cur == nil || cur != base {
+		out := outcome{kind: ocError, reason: "superseded"}
+		if cur != nil {
+			out = outcome{kind: ocStored, entry: cur, label: "hit"}
+		}
+		f.setOutcome(out)
+		p.flights.Finish(key, f)
+		return
+	}
+
+	out := p.fetch(ctx, key, id, variant, base)
+	f.setOutcome(out)        // 先唤醒同步等待者（如加入的条件请求）
+	p.flights.Finish(key, f) // 再拆键
+}
+
 func (p *Proxy) lookup(key string) *entry {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -191,15 +283,46 @@ func (p *Proxy) put(key string, e *entry) {
 	p.store[key] = e
 }
 
-func (p *Proxy) remove(key string) {
+// putIfAbsent 仅在键不存在时写入，返回是否写入成功。冷缺失回源用它避免
+// 覆盖并发路径（如冷条件透传）已建立的条目。
+func (p *Proxy) putIfAbsent(key string, e *entry) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	delete(p.store, key)
+	if _, exists := p.store[key]; exists {
+		return false
+	}
+	p.store[key] = e
+	return true
+}
+
+// swapIf 仅在当前条目仍是 old 时，把它替换为 new（new 为 nil 表示删除）。
+// 这是后台刷新的提交守卫：回源基于某个旧条目发出，提交时若缓存条目已被
+// 更新，则本轮结果已过时，必须丢弃，不能把旧内容重新写成新版本。
+// 返回提交是否生效以及当前实际条目。
+func (p *Proxy) swapIf(key string, old, new *entry) (*entry, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	cur, exists := p.store[key]
+	if !exists || cur != old {
+		return cur, false
+	}
+	if new == nil {
+		delete(p.store, key)
+	} else {
+		p.store[key] = new
+	}
+	return new, true
 }
 
 // ---------- 回源 ----------
 
 // fetch 执行一次回源。existing 非 nil 时表示持有过期条目，做条件再验证。
+//
+// 提交规则保证后台刷新不会用迟到结果覆盖更新后的条目：
+//   - 304 续期 / 可缓存 200：仅当当前条目仍是发起回源时的 existing 才写入；
+//   - 4xx 等否定响应：仅在条目仍是 existing 时作废旧条目；
+//   - 5xx / 网络错误：不动缓存条目，交给陈旧兜底；
+//   - existing 为 nil（冷缺失）时，用 putIfAbsent 避免覆盖并发填充。
 func (p *Proxy) fetch(ctx context.Context, key, id string, variant lang.Variant, existing *entry) outcome {
 	req := p.buildOriginRequest(ctx, rAsset{id: id, variant: variant})
 	if existing != nil {
@@ -236,38 +359,78 @@ func (p *Proxy) fetch(ctx context.Context, key, id string, variant lang.Variant,
 		if ttl, ok := cacheable(refreshed.header); ok {
 			refreshed.maxAge = ttl
 		}
+		// 304 头里的 SWR 指令若显式出现则更新；未出现则沿用原条目窗口
+		// （304 仅更新被携带的元数据）。
+		if swr, present := staleWhileRevalidate(refreshed.header); present {
+			refreshed.swrSet = true
+			refreshed.swr = swr
+		}
 		refreshed.storedAt = p.clock.Now()
-		p.put(key, &refreshed)
-		return outcome{kind: ocStored, entry: &refreshed, label: "revalidated"}
+		if cur, committed := p.swapIf(key, existing, &refreshed); committed {
+			return outcome{kind: ocStored, entry: &refreshed, label: "revalidated"}
+		} else {
+			// 提交守卫：条目已被更新，丢弃本轮迟到续期。
+			return p.supersededOutcome(cur)
+		}
 
 	case resp.StatusCode == http.StatusOK:
 		if readErr != nil {
 			return p.failureOutcome(existing, "origin-read-error")
 		}
 		if ttl, ok := cacheable(resp.Header); ok {
+			swr, swrPresent := staleWhileRevalidate(resp.Header)
 			e := newEntry(resp, body, ttl, p.clock.Now())
-			p.put(key, e)
-			return outcome{kind: ocStored, entry: e, label: "miss"}
+			e.swrSet = swrPresent
+			e.swr = swr
+			if existing == nil {
+				if !p.putIfAbsent(key, e) {
+					// 冷回源期间条目已被并发填充：不覆盖，直接复用当前条目。
+					if cur := p.lookup(key); cur != nil {
+						return outcome{kind: ocStored, entry: cur, label: "hit"}
+					}
+					p.put(key, e)
+				}
+				return outcome{kind: ocStored, entry: e, label: "miss"}
+			}
+			if cur, committed := p.swapIf(key, existing, e); committed {
+				return outcome{kind: ocStored, entry: e, label: "miss"}
+			} else {
+				// 迟到刷新：旧版本不得覆盖已更新的当前条目。
+				return p.supersededOutcome(cur)
+			}
 		}
+		// 源站已不再允许缓存此表示：仅当条目仍是 existing 时作废。
 		if existing != nil {
-			p.remove(key) // 源站已不再允许缓存此表示
+			p.swapIf(key, existing, nil)
 		}
 		return bypassOutcome(resp, body)
 
 	case resp.StatusCode >= 500:
-		// 5xx 不删除旧条目：在兜底窗口内仍可服务过期内容。
+		// 5xx 不删除旧条目：在兜底窗口内仍可服务过期内容；
+		// 已进入 SWR 窗口的条目同样保持不变，后台刷新失败不抹去可用旧内容
+		// （后续 SWR 请求仍能返回它，见 serveStaleWhileRevalidate）。
 		return p.failureOutcome(existing, "origin-"+strconv.Itoa(resp.StatusCode))
 
 	default:
-		// 4xx 等：源站否定了该资源，旧表示必须作废，响应透传。
+		// 4xx 等：源站否定了该资源，旧表示按现有失效语义作废；
+		// 但仍以提交守卫确认它还是发起回源时的那条，避免误删更新后的条目。
 		if existing != nil {
-			p.remove(key)
+			p.swapIf(key, existing, nil)
 		}
 		if readErr != nil {
 			return p.failureOutcome(existing, "origin-read-error")
 		}
 		return bypassOutcome(resp, body)
 	}
+}
+
+// supersededOutcome 构造“迟到刷新被提交守卫拒绝”后的结果：
+// 当前条目若仍可用则交给调用方（绝不用旧内容覆盖它），否则视为内部失效。
+func (p *Proxy) supersededOutcome(cur *entry) outcome {
+	if cur == nil {
+		return outcome{kind: ocError, reason: "superseded"}
+	}
+	return outcome{kind: ocStored, entry: cur, label: "hit"}
 }
 
 // failureOutcome 在回源失败时选择“过期兜底”或 502。
@@ -301,8 +464,19 @@ func (p *Proxy) forwardColdConditional(w http.ResponseWriter, r *http.Request, k
 	if resp.StatusCode == http.StatusOK {
 		if ttl, ok := cacheable(resp.Header); ok {
 			e := newEntry(resp, body, ttl, p.clock.Now())
-			p.put(key, e)
-			writeStored(w, p.clock, e, "miss", "")
+			if swr, present := staleWhileRevalidate(resp.Header); present {
+				e.swrSet = true
+				e.swr = swr
+			}
+			// 与并发回源赛跑时不覆盖已建立的条目。
+			if p.putIfAbsent(key, e) {
+				writeStored(w, p.clock, e, "miss", "")
+			} else if cur := p.lookup(key); cur != nil {
+				writeStored(w, p.clock, cur, "hit", "")
+			} else {
+				p.put(key, e)
+				writeStored(w, p.clock, e, "miss", "")
+			}
 			return
 		}
 	}
